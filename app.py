@@ -107,7 +107,10 @@ def analyser(message, model, vectorizer):
 # ----------------------------------------------------------------------
 # COUCHE 2 : Google Safe Browsing (réputation des liens)
 # ----------------------------------------------------------------------
-URL_REGEX = re.compile(r'(https?://\S+|www\.\S+)', re.IGNORECASE)
+URL_REGEX = re.compile(
+    r'(https?://\S+|www\.\S+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+/[^\s]*)',
+    re.IGNORECASE,
+)
 
 def extraire_liens(message):
     liens = URL_REGEX.findall(message)
