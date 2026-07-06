@@ -1,0 +1,9 @@
+# Secrets — ne JAMAIS pousser (clés API, compte de service)
+.streamlit/secrets.toml
+
+# Sauvegardes automatiques de Jupyter (inutiles sur GitHub)
+.ipynb_checkpoints/
+
+# Caches Python (fichiers générés, inutiles)
+__pycache__/
+*.pyc

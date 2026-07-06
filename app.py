@@ -1,15 +1,23 @@
 """
 Guardia : Système de Détection d'Arnaques
-Interface de démonstration (Streamlit).
+Streamlit + Google Safe Browsing (liens) + Signalement communautaire (Google Sheets).
 
 Lancement :   python -m streamlit run app.py
 Prérequis :   model.pkl + vectorizer.pkl dans le même dossier
-              (et, en option, logo.png pour le logo de la barre latérale).
+Secrets :     .streamlit/secrets.toml (local) ou Settings > Secrets (Streamlit Cloud)
+              - SAFE_BROWSING_KEY  : clé API Google Safe Browsing (option)
+              - [gcp_service_account] : compte de service pour Google Sheets (option)
+              - SHEET_NAME : nom du Google Sheet des signalements (option)
+Chaque couche externe est NON BLOQUANTE : si un secret manque ou une API
+échoue, Guardia continue avec le modèle seul.
 """
 
 import os
 import re
 import pickle
+from datetime import datetime
+
+import requests
 import streamlit as st
 
 # ----------------------------------------------------------------------
@@ -22,7 +30,7 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------------------------
-# Style des encadrés de la barre latérale
+# Styles
 # ----------------------------------------------------------------------
 st.markdown(
     """
@@ -62,13 +70,12 @@ st.markdown(
 )
 
 # ----------------------------------------------------------------------
-# Seuil de prudence (zone « Suspect » entre SEUIL et 1-SEUIL)
+# Paramètres
 # ----------------------------------------------------------------------
-SEUIL = 0.65
+SEUIL = 0.65  # zone « Suspect » entre (1-SEUIL) et SEUIL
 
 # ----------------------------------------------------------------------
-# Nettoyage du texte
-# ⚠️ DOIT ÊTRE IDENTIQUE à la fonction utilisée à l'entraînement.
+# Nettoyage du texte — IDENTIQUE à l'entraînement (ne jamais diverger)
 # ----------------------------------------------------------------------
 def clean_text_expert(text):
     text = str(text).lower()
@@ -79,7 +86,7 @@ def clean_text_expert(text):
     return text
 
 # ----------------------------------------------------------------------
-# Chargement du modèle (mis en cache : chargé une seule fois)
+# COUCHE 1 : le modèle (le cœur de Guardia)
 # ----------------------------------------------------------------------
 @st.cache_resource
 def charger_modele():
@@ -96,6 +103,76 @@ def analyser(message, model, vectorizer):
     classes = list(model.classes_)
     p_arnaque = float(proba[classes.index("arnaque")])
     return texte_propre, p_arnaque
+
+# ----------------------------------------------------------------------
+# COUCHE 2 : Google Safe Browsing (réputation des liens)
+# ----------------------------------------------------------------------
+URL_REGEX = re.compile(r'(https?://\S+|www\.\S+)', re.IGNORECASE)
+
+def extraire_liens(message):
+    liens = URL_REGEX.findall(message)
+    return [l if l.lower().startswith("http") else "http://" + l for l in liens]
+
+def verifier_liens_safe_browsing(liens):
+    """Retourne (liens_dangereux, api_ok). Jamais bloquant."""
+    api_key = st.secrets.get("SAFE_BROWSING_KEY", None)
+    if not api_key or not liens:
+        return [], False
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+    corps = {
+        "client": {"clientId": "guardia-ipnet", "clientVersion": "1.0"},
+        "threatInfo": {
+            "threatTypes": [
+                "MALWARE",
+                "SOCIAL_ENGINEERING",
+                "UNWANTED_SOFTWARE",
+                "POTENTIALLY_HARMFUL_APPLICATION",
+            ],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": l} for l in liens],
+        },
+    }
+    try:
+        r = requests.post(endpoint, json=corps, timeout=5)
+        r.raise_for_status()
+        matches = r.json().get("matches", [])
+        return sorted({m["threat"]["url"] for m in matches}), True
+    except Exception:
+        return [], False
+
+# ----------------------------------------------------------------------
+# COUCHE 3 : signalement communautaire -> Google Sheets (file de validation)
+# ----------------------------------------------------------------------
+@st.cache_resource
+def connecter_sheet():
+    """Connexion au Google Sheet des signalements. Retourne la feuille ou None."""
+    try:
+        import gspread
+        creds = dict(st.secrets["gcp_service_account"])
+        client = gspread.service_account_from_dict(creds)
+        nom = st.secrets.get("SHEET_NAME", "guardia_signalements")
+        return client.open(nom).sheet1
+    except Exception:
+        return None
+
+def envoyer_signalement(sheet, message, verdict_modele, p_arnaque, avis_utilisateur):
+    """Ajoute une ligne dans la file de validation. Retourne True si OK."""
+    try:
+        sheet.append_row(
+            [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                message,
+                verdict_modele,
+                f"{p_arnaque * 100:.0f}%",
+                avis_utilisateur,
+                "EN ATTENTE",  # statut de validation (à changer à la main)
+            ],
+            value_input_option="RAW",
+        )
+        return True
+    except Exception:
+        return False
 
 # ======================================================================
 # BARRE LATÉRALE
@@ -140,7 +217,6 @@ with st.sidebar:
 st.title("🛡️ Guardia : Système de Détection d'Arnaques")
 st.markdown("Analysez vos SMS ou emails suspects grâce à l'Intelligence Artificielle.")
 
-# Vérifie la présence des fichiers du modèle
 if not (os.path.exists("model.pkl") and os.path.exists("vectorizer.pkl")):
     st.error(
         "❌ Fichiers **model.pkl** et **vectorizer.pkl** introuvables. "
@@ -156,38 +232,122 @@ message = st.text_area(
     height=160,
 )
 
+# --- Analyse : le résultat est stocké en session pour survivre aux reruns ---
 if st.button("Lancer l'Analyse", type="primary"):
     if not message.strip():
         st.warning("Veuillez d'abord coller un message à analyser.")
+        st.session_state.pop("resultat", None)
     else:
         texte_propre, p_arnaque = analyser(message, model, vectorizer)
+        liens = extraire_liens(message)
+        liens_dangereux, api_ok = verifier_liens_safe_browsing(liens)
 
-        if p_arnaque >= SEUIL:
+        if liens_dangereux:
+            verdict = "arnaque (lien malveillant confirmé)"
+        elif p_arnaque >= SEUIL:
+            verdict = "arnaque"
+        elif p_arnaque <= (1 - SEUIL):
+            verdict = "legitime"
+        else:
+            verdict = "suspect"
+
+        st.session_state["resultat"] = {
+            "message": message,
+            "texte_propre": texte_propre,
+            "p_arnaque": p_arnaque,
+            "liens": liens,
+            "liens_dangereux": liens_dangereux,
+            "api_ok": api_ok,
+            "verdict": verdict,
+        }
+        st.session_state["signale"] = False  # nouveau message => nouveau signalement possible
+
+# --- Affichage du verdict (depuis la session) ---
+res = st.session_state.get("resultat")
+if res:
+    if res["liens_dangereux"]:
+        st.markdown(
+            '<div class="verdict v-arnaque">🔴 ARNAQUE CONFIRMÉE — '
+            "ce message contient un lien signalé comme dangereux par "
+            "Google Safe Browsing.</div>",
+            unsafe_allow_html=True,
+        )
+        for l in res["liens_dangereux"]:
+            st.error(f"⛔ Lien malveillant détecté : `{l}`")
+        st.metric("Probabilité d'arnaque (modèle)", f"{res['p_arnaque'] * 100:.0f} %")
+    else:
+        if res["verdict"] == "arnaque":
             st.markdown(
                 '<div class="verdict v-arnaque">🔴 ARNAQUE PROBABLE — '
-                'méfiez-vous de ce message.</div>',
+                "méfiez-vous de ce message.</div>",
                 unsafe_allow_html=True,
             )
-        elif p_arnaque <= (1 - SEUIL):
+        elif res["verdict"] == "legitime":
             st.markdown(
                 '<div class="verdict v-legitime">🟢 MESSAGE LÉGITIME — '
-                'rien de suspect détecté.</div>',
+                "rien de suspect détecté.</div>",
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
                 '<div class="verdict v-suspect">🟠 SUSPECT — À VÉRIFIER. '
                 "Dans le doute, ne cliquez sur aucun lien et ne partagez "
-                'aucune information personnelle.</div>',
+                "aucune information personnelle.</div>",
                 unsafe_allow_html=True,
             )
-
         st.write("")
-        st.metric("Probabilité d'arnaque", f"{p_arnaque * 100:.0f} %")
-        st.progress(p_arnaque)
+        st.metric("Probabilité d'arnaque", f"{res['p_arnaque'] * 100:.0f} %")
+        st.progress(res["p_arnaque"])
 
-        with st.expander("🔎 Voir le texte analysé par l'IA (après nettoyage)"):
-            st.code(texte_propre or "(vide)")
+        if res["liens"] and res["api_ok"]:
+            st.info(
+                f"🔍 {len(res['liens'])} lien(s) vérifié(s) via Google Safe Browsing : "
+                "non répertorié(s) comme malveillant(s). Prudence néanmoins : un lien "
+                "très récent peut ne pas encore être répertorié."
+            )
+        elif res["liens"] and not res["api_ok"]:
+            st.caption(
+                "ℹ️ Lien détecté, mais vérification de réputation indisponible "
+                "(analyse effectuée par le modèle seul)."
+            )
+
+    with st.expander("🔎 Voir le texte analysé par l'IA (après nettoyage)"):
+        st.code(res["texte_propre"] or "(vide)")
+
+    # ------------------------------------------------------------------
+    # Signalement communautaire (file de validation, jamais direct)
+    # ------------------------------------------------------------------
+    sheet = connecter_sheet()
+    if sheet is not None:
+        st.markdown("---")
+        st.markdown("### 📨 Aider Guardia à s'améliorer")
+        if st.session_state.get("signale"):
+            st.success(
+                "✅ Merci ! Votre signalement a été transmis. Il sera examiné "
+                "par un humain avant d'enrichir l'entraînement de Guardia."
+            )
+        else:
+            st.markdown(
+                "Ce message est une arnaque réelle que vous avez reçue ? "
+                "Signalez-le : après **validation humaine**, il renforcera Guardia."
+            )
+            avis = st.radio(
+                "Selon vous, ce message est :",
+                ["arnaque", "legitime", "je ne sais pas"],
+                horizontal=True,
+            )
+            if st.button("📨 Envoyer le signalement"):
+                ok = envoyer_signalement(
+                    sheet, res["message"], res["verdict"], res["p_arnaque"], avis
+                )
+                if ok:
+                    st.session_state["signale"] = True
+                    st.rerun()
+                else:
+                    st.error(
+                        "Le signalement n'a pas pu être transmis. "
+                        "Réessayez plus tard."
+                    )
 
 st.markdown("---")
 st.caption("Projet de soutenance IPNET - IA & Cybersécurité - 2026")
