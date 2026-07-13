@@ -72,7 +72,7 @@ st.markdown(
 # ----------------------------------------------------------------------
 # Paramètres
 # ----------------------------------------------------------------------
-SEUIL = 0.65  # zone « Suspect » entre (1-SEUIL) et SEUIL
+SEUIL = 0.75  # zone « Suspect » entre (1-SEUIL) et SEUIL — calibré après tests
 
 # ----------------------------------------------------------------------
 # Nettoyage du texte — IDENTIQUE à l'entraînement (ne jamais diverger)
@@ -149,16 +149,14 @@ def verifier_liens_safe_browsing(liens):
 # ----------------------------------------------------------------------
 @st.cache_resource
 def connecter_sheet():
-    """Connexion au Google Sheet des signalements. Retourne la feuille ou None.
-    MODE DEBUG : affiche l'erreur dans la barre laterale (a retirer avant la demo)."""
+    """Connexion au Google Sheet des signalements. Retourne la feuille ou None."""
     try:
         import gspread
         creds = dict(st.secrets["gcp_service_account"])
         client = gspread.service_account_from_dict(creds)
         nom = st.secrets.get("SHEET_NAME", "guardia_signalements")
         return client.open(nom).sheet1
-    except Exception as e:
-        st.sidebar.error(f"DEBUG connexion Sheet : {type(e).__name__} — {e}")
+    except Exception:
         return None
 
 def envoyer_signalement(sheet, message, verdict_modele, p_arnaque, avis_utilisateur):
