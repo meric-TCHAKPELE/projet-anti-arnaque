@@ -1,9 +1,10 @@
-# Secrets — ne JAMAIS pousser (clés API, compte de service)
+# --- Secrets : ne JAMAIS pousser sur GitHub ---
 .streamlit/secrets.toml
+guardia-service-account.json
+guardia-*.json
 
-# Sauvegardes automatiques de Jupyter (inutiles sur GitHub)
+# --- Fichiers generes / sauvegardes locales ---
+data/messages.csv.bak
 .ipynb_checkpoints/
-
-# Caches Python (fichiers générés, inutiles)
 __pycache__/
 *.pyc
