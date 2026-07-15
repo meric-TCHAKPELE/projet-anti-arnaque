@@ -25,21 +25,32 @@ import gspread
 # CONFIGURATION — adapte ces 3 lignes à ta machine
 # ----------------------------------------------------------------------
 CHEMIN_JSON  = "guardia-501622-45cfa2e91af2.json"   # ton fichier JSON du compte de service
-NOM_FEUILLE  = "Signalements"                   # le nom exact du Google Sheet
-CHEMIN_CSV   = "data/messages.csv"              # ta base d'entraînement
-
-# Colonnes attendues dans la feuille (ordre de l'app) :
-# Date | Message | Verdict | Probabilité | Avis | Statut
-COL_MESSAGE, COL_AVIS, COL_STATUT = "Message", "Avis", "Statut"
+NOM_FEUILLE  = "Signalements"                        # le nom exact du Google Sheet
+CHEMIN_CSV   = "data/messages.csv"                   # ta base d'entraînement
 
 # ----------------------------------------------------------------------
+def canon(valeur):
+    """Forme canonique d'une cellule : espaces (y compris insécables),
+    casse et accents neutralisés. Rend le script tolérant aux
+    copier-coller et aux libellés approximatifs."""
+    v = str(valeur).replace("\u00a0", " ").strip().lower()
+    for a, b in (("é","e"), ("è","e"), ("ê","e"), ("à","a"), ("î","i")):
+        v = v.replace(a, b)
+    return v
+
 def normaliser(texte):
-    """Forme canonique d'un message pour comparer les doublons :
-    minuscules + espaces normalisés (pour attraper les copies
-    quasi identiques, pas seulement les copies exactes)."""
+    """Forme canonique d'un message pour la déduplication :
+    minuscules + espaces normalisés."""
     texte = str(texte).lower().strip()
-    texte = re.sub(r"\s+", " ", texte)
-    return texte
+    return re.sub(r"\s+", " ", texte)
+
+def trouver_colonne(entetes, cible):
+    """Trouve l'index (0-based) de la colonne dont l'en-tête canonisé
+    commence par la cible ('statut' matche aussi 'Statut du message')."""
+    for idx, h in enumerate(entetes):
+        if canon(h).startswith(cible):
+            return idx
+    return None
 
 def main():
     # --- 1. Connexion à la feuille -----------------------------------
@@ -51,24 +62,34 @@ def main():
     except gspread.SpreadsheetNotFound:
         sys.exit(f"❌ Feuille « {NOM_FEUILLE} » introuvable (nom exact ? partage ?).")
 
-    lignes = feuille.get_all_records()   # liste de dicts, en-têtes = clés
-    if not lignes:
+    valeurs = feuille.get_all_values()          # toutes les cellules, brutes
+    if len(valeurs) < 2:
         sys.exit("ℹ️ La feuille est vide, rien à faire.")
+
+    # --- 2. Détection automatique des colonnes ------------------------
+    entetes = valeurs[0]
+    idx_msg    = trouver_colonne(entetes, "message")
+    idx_avis   = trouver_colonne(entetes, "avis")
+    idx_statut = trouver_colonne(entetes, "statut")
+    if None in (idx_msg, idx_avis, idx_statut):
+        sys.exit(f"❌ Colonnes introuvables. En-têtes lus : {entetes}\n"
+                 "   Il faut une colonne Message, une colonne Avis et une colonne Statut.")
+    def lettre(i):  # index -> lettre de colonne (A, B, C...)
+        return chr(ord("A") + i)
+    print(f"🧭 Colonnes détectées : Message={lettre(idx_msg)}, "
+          f"Avis={lettre(idx_avis)}, Statut={lettre(idx_statut)}")
+
+    lignes = valeurs[1:]
     print(f"📥 {len(lignes)} signalement(s) lu(s) dans la feuille.")
 
-    # --- 2. Filtrage : uniquement les VALIDÉ, avec un avis exploitable
-    def canon(valeur):
-        """Nettoie une valeur de cellule : espaces (y c. insécables) et accents.
-        Rend la comparaison tolérante aux copier-coller imparfaits."""
-        v = str(valeur).replace("\u00a0", " ").strip().lower()
-        return (v.replace("é", "e").replace("è", "e").replace("ê", "e")
-                 .replace("à", "a").replace("î", "i"))
-
+    # --- 3. Filtrage : uniquement les VALIDÉ, avec un avis exploitable
     a_integrer, ignores = [], {"attente": 0, "integre": 0, "avis": 0}
     for i, l in enumerate(lignes, start=2):        # ligne 1 = en-têtes
-        statut = canon(l.get(COL_STATUT, "")).upper()
-        avis   = canon(l.get(COL_AVIS, ""))
-        msg    = str(l.get(COL_MESSAGE, "")).strip()
+        def cellule(idx):
+            return l[idx] if idx < len(l) else ""
+        statut = canon(cellule(idx_statut)).upper()
+        avis   = canon(cellule(idx_avis))
+        msg    = str(cellule(idx_msg)).strip()
 
         if statut == "INTEGRE":
             ignores["integre"] += 1
@@ -88,7 +109,7 @@ def main():
     if not a_integrer:
         sys.exit("ℹ️ Aucun nouveau signalement validé à intégrer.")
 
-    # --- 3. Chargement du CSV + déduplication ------------------------
+    # --- 4. Chargement du CSV + déduplication ------------------------
     if os.path.exists(CHEMIN_CSV):
         base = pd.read_csv(CHEMIN_CSV)
     else:
@@ -106,7 +127,7 @@ def main():
 
     print(f"   ➕ nouveaux uniques : {len(nouveaux)}   ♻️ doublons écartés : {doublons}")
 
-    # --- 4. Sauvegarde (avec copie de sûreté) -------------------------
+    # --- 5. Sauvegarde (avec copie de sûreté) -------------------------
     if nouveaux:
         base.to_csv(CHEMIN_CSV + ".bak", index=False)   # filet de sécurité
         ajout = pd.DataFrame(
@@ -119,12 +140,9 @@ def main():
               f"{(base['label']=='legitime').sum()} légitimes). "
               f"Copie de sûreté : {CHEMIN_CSV}.bak")
 
-    # --- 5. Marquage INTÉGRÉ dans la feuille --------------------------
-    # (les doublons aussi : ils ont été traités, inutile de les revoir)
-    en_tetes = feuille.row_values(1)
-    col_statut_idx = en_tetes.index(COL_STATUT) + 1
+    # --- 6. Marquage INTÉGRÉ dans la feuille --------------------------
     for item in a_integrer:
-        feuille.update_cell(item["ligne"], col_statut_idx, "INTÉGRÉ")
+        feuille.update_cell(item["ligne"], idx_statut + 1, "INTÉGRÉ")
     print(f"🏷️ {len(a_integrer)} ligne(s) marquée(s) INTÉGRÉ dans la feuille.")
 
     print("\n✅ Terminé. Prochaine étape : relancer la cellule d'entraînement "
