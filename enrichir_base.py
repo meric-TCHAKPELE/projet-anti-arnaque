@@ -57,16 +57,23 @@ def main():
     print(f"📥 {len(lignes)} signalement(s) lu(s) dans la feuille.")
 
     # --- 2. Filtrage : uniquement les VALIDÉ, avec un avis exploitable
+    def canon(valeur):
+        """Nettoie une valeur de cellule : espaces (y c. insécables) et accents.
+        Rend la comparaison tolérante aux copier-coller imparfaits."""
+        v = str(valeur).replace("\u00a0", " ").strip().lower()
+        return (v.replace("é", "e").replace("è", "e").replace("ê", "e")
+                 .replace("à", "a").replace("î", "i"))
+
     a_integrer, ignores = [], {"attente": 0, "integre": 0, "avis": 0}
     for i, l in enumerate(lignes, start=2):        # ligne 1 = en-têtes
-        statut = str(l.get(COL_STATUT, "")).strip().upper()
-        avis   = str(l.get(COL_AVIS, "")).strip().lower()
+        statut = canon(l.get(COL_STATUT, "")).upper()
+        avis   = canon(l.get(COL_AVIS, ""))
         msg    = str(l.get(COL_MESSAGE, "")).strip()
 
-        if statut in ("INTEGRE", "INTÉGRÉ"):
+        if statut == "INTEGRE":
             ignores["integre"] += 1
             continue
-        if statut not in ("VALIDE", "VALIDÉ"):
+        if statut != "VALIDE":
             ignores["attente"] += 1                # EN ATTENTE, REJETÉ, etc.
             continue
         if avis not in ("arnaque", "legitime") or not msg:
