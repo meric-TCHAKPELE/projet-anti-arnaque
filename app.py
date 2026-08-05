@@ -14,6 +14,7 @@ Chaque couche externe est NON BLOQUANTE : si un secret manque ou une API
 
 import os
 import re
+import html
 import pickle
 from datetime import datetime
 
@@ -76,11 +77,34 @@ SEUIL = 0.75  # zone « Suspect » entre (1-SEUIL) et SEUIL — calibré après 
 
 # ----------------------------------------------------------------------
 # Nettoyage du texte — IDENTIQUE à l'entraînement (ne jamais diverger)
+# Version étendue : dé-échappement HTML + neutralisation des marqueurs
+# d'anonymisation du dataset (<decimal>, <url>, ...) + token [devise].
 # ----------------------------------------------------------------------
 def clean_text_expert(text):
     text = str(text).lower()
+
+    # 0) Dé-échapper le HTML AVANT tout : &lt;decimal&gt; -> <decimal>
+    #    (sinon on récolte les tokens parasites lt / gt / decimal)
+    text = html.unescape(text)
+
+    # 1) Marqueurs d'anonymisation du dataset -> mêmes tokens neutres que le reste
+    text = re.sub(r'<\s*url\s*>', ' [url_detecte] ', text)
+    text = re.sub(r'<\s*(?:decimal|#|number|num|time|date|money|phone|email)\s*>',
+                  ' [montant_chiffre] ', text)
+    text = re.sub(r'<[^>]*>', ' ', text)          # tout autre <...> restant -> espace
+
+    # 2) URLs réelles
     text = re.sub(r'http\S+|www\S+', ' [url_detecte] ', text)
+
+    # 3) Devises -> un seul token neutre (unifie £ / $ / € / fcfa, tue le biais géo)
+    text = re.sub(r'[£$€]', ' [devise] ', text)
+    text = re.sub(r'\b(?:fcfa|cfa|xof|gbp|usd|eur|dollars?|euros?|francs?)\b',
+                  ' [devise] ', text)
+
+    # 4) Nombres / montants
     text = re.sub(r'\d+', ' [montant_chiffre] ', text)
+
+    # 5) Ne garder que lettres (accents fr), crochets des tokens, espaces
     text = re.sub(r'[^a-zàâçéèêëîïôûùÿñæœ\[\]\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
