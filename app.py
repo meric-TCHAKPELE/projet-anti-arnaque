@@ -3,7 +3,7 @@ Guardia : Système de Détection d'Arnaques
 Streamlit + Google Safe Browsing (liens) + Signalement communautaire (Google Sheets).
 
 Lancement :   python -m streamlit run app.py
-Prérequis :   model.pkl + vectorizer.pkl dans le même dossier
+Prérequis :   model.pkl + vectorizer.pkl + numeros.py dans le même dossier
 Secrets :     .streamlit/secrets.toml (local) ou Settings > Secrets (Streamlit Cloud)
               - SAFE_BROWSING_KEY  : clé API Google Safe Browsing (option)
               - [gcp_service_account] : compte de service pour Google Sheets (option)
@@ -20,6 +20,8 @@ from datetime import datetime
 
 import requests
 import streamlit as st
+
+import numeros  # logique partagée de vérification de numéros (fichier numeros.py)
 
 # ----------------------------------------------------------------------
 # Configuration de la page (DOIT être le premier appel Streamlit)
@@ -173,13 +175,25 @@ def verifier_liens_safe_browsing(liens):
 # ----------------------------------------------------------------------
 @st.cache_resource
 def connecter_sheet():
-    """Connexion au Google Sheet des signalements. Retourne la feuille ou None."""
+    """Connexion au Google Sheet des signalements (onglet principal). Retourne la feuille ou None."""
     try:
         import gspread
         creds = dict(st.secrets["gcp_service_account"])
         client = gspread.service_account_from_dict(creds)
         nom = st.secrets.get("SHEET_NAME", "guardia_signalements")
         return client.open(nom).sheet1
+    except Exception:
+        return None
+
+@st.cache_resource
+def connecter_numeros():
+    """Connexion à l'onglet 'numeros' du MÊME Google Sheet. Retourne la feuille ou None."""
+    try:
+        import gspread
+        creds = dict(st.secrets["gcp_service_account"])
+        client = gspread.service_account_from_dict(creds)
+        nom = st.secrets.get("SHEET_NAME", "guardia_signalements")
+        return client.open(nom).worksheet("numeros")
     except Exception:
         return None
 
@@ -375,6 +389,70 @@ if res:
                         "Le signalement n'a pas pu être transmis. "
                         "Réessayez plus tard."
                     )
+
+# ======================================================================
+# VÉRIFICATION DE NUMÉRO (base communautaire)
+# ======================================================================
+st.markdown("---")
+st.markdown("## 📞 Vérifier un numéro de téléphone")
+st.markdown(
+    "Un numéro vous a appelé ou écrit ? Vérifiez s'il a déjà été signalé "
+    "par la communauté Guardia."
+)
+
+ws_num = connecter_numeros()
+if ws_num is None:
+    st.caption("ℹ️ Base communautaire de numéros indisponible pour le moment.")
+else:
+    numero_saisi = st.text_input(
+        "Numéro à vérifier :",
+        placeholder="Ex : +228 90 00 00 00",
+        key="input_numero",
+    )
+
+    if st.button("🔍 Vérifier le numéro"):
+        if not numero_saisi.strip():
+            st.warning("Entrez d'abord un numéro.")
+            st.session_state.pop("res_num", None)
+        else:
+            st.session_state["res_num"] = numeros.verifier_numero(ws_num, numero_saisi)
+            st.session_state["num_saisi"] = numero_saisi
+            st.session_state["num_signale"] = False
+
+    rn = st.session_state.get("res_num")
+    if rn is not None:
+        texte = numeros.message_verification(rn)
+        if not rn.get("valide"):
+            st.warning(texte)
+        elif rn["total"] == 0:
+            st.success(texte)
+        else:
+            st.error(texte)
+
+        # --- Signaler ce numéro (validation humaine) ---
+        if rn.get("valide"):
+            if st.session_state.get("num_signale"):
+                st.success(
+                    "✅ Merci ! Ce numéro a été signalé. Il sera examiné par "
+                    "un humain avant d'être confirmé dans la base."
+                )
+            else:
+                st.markdown("**Ce numéro vous a arnaqué ou paraît suspect ?**")
+                motif = st.text_input(
+                    "Motif (facultatif) :",
+                    placeholder="Ex : faux agent Mobile Money",
+                    key="motif_numero",
+                )
+                if st.button("🚩 Signaler ce numéro"):
+                    ok = numeros.signaler_numero(
+                        ws_num, st.session_state.get("num_saisi", numero_saisi),
+                        motif, source="app",
+                    )
+                    if ok:
+                        st.session_state["num_signale"] = True
+                        st.rerun()
+                    else:
+                        st.error("Le signalement n'a pas pu être transmis. Réessayez plus tard.")
 
 st.markdown("---")
 st.caption("Projet de soutenance IPNET - IA & Cybersécurité - 2026")
